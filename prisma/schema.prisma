@@ -1,0 +1,231 @@
+// X → Binance Square 自动同步系统 · 数据模型
+//
+// 设计依据：docs/系统设计文档.md §21
+//
+// 全局约定（§20.4）：
+//   - 所有时间列使用 timestamptz，应用层一律 UTC
+//   - X Tweet ID 是 64 位 Snowflake，超出 JS 安全整数范围，统一用 String 存储（§21.3）
+//   - 所有 Token / API Key 列只存 AES-256-GCM 密文，禁止明文（§7.4）
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// 同步任务状态机（§9.1）。
+/// 合法转移由 packages/shared 的状态机表在运行时强制校验，非法转移抛错（§9.2）。
+enum JobStatus {
+  DISCOVERED
+  FILTERED
+  QUEUED
+  PROCESSING
+  MEDIA_PROCESSING
+  PUBLISHING
+  SUCCESS
+  FAILED
+  UNCERTAIN
+  CANCELLED
+}
+
+/// 后台管理员（§19.1）。
+/// V1 为账号 + 密码（Argon2id）；totp_secret_encrypted 为 V2 TOTP 预留字段。
+model AdminUser {
+  id                  String   @id @default(cuid())
+  username            String   @unique
+  passwordHash        String   @map("password_hash")
+  totpSecretEncrypted String?  @map("totp_secret_encrypted")
+  mustChangePassword  Boolean  @default(true) @map("must_change_password")
+  createdAt           DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  @@map("admin_users")
+}
+
+/// 被监控的 X 账号（V1 单账号，§22.2）。
+/// status: PENDING / ACTIVE / TOKEN_EXPIRED / PAUSED / ERROR
+model XAccount {
+  id                    String    @id @default(cuid())
+  xUserId               String    @unique @map("x_user_id")
+  username              String
+  accessTokenEncrypted  String    @map("access_token_encrypted")
+  refreshTokenEncrypted String    @map("refresh_token_encrypted")
+  tokenExpiresAt        DateTime  @map("token_expires_at") @db.Timestamptz
+  /// 已成功处理的最大 Tweet ID（Snowflake，字符串保存避免精度问题）
+  lastTweetId           String?   @map("last_tweet_id")
+  /// 首次连接时记录的基线 ID，用于审计「历史帖子未被同步」（§6.5）
+  baselineTweetId       String?   @map("baseline_tweet_id")
+  lastPollAt            DateTime? @map("last_poll_at") @db.Timestamptz
+  /// OK / RATE_LIMITED / AUTH_FAILED / NETWORK_ERROR / SERVER_ERROR（§6.3）
+  lastPollStatus        String?   @map("last_poll_status")
+  consecutiveFailures   Int       @default(0) @map("consecutive_failures")
+  /// 轮询间隔秒数，合法值 15 / 30 / 60 / 120 / 300（§6.2）
+  pollIntervalSec       Int       @default(30) @map("poll_interval_sec")
+  monitoringEnabled     Boolean   @default(true) @map("monitoring_enabled")
+  status                String    @default("PENDING")
+  createdAt             DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt             DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+
+  posts XPost[]
+
+  @@map("x_accounts")
+}
+
+/// Binance Square 发布账号（V1 单账号）。
+model BinanceAccount {
+  id              String   @id @default(cuid())
+  name            String
+  /// AES-256-GCM 密文，永不回显完整值（§11.6）
+  apiKeyEncrypted String   @map("api_key_encrypted")
+  /// 掩码形式 abc12...xyz9，可直接展示给 UI
+  apiKeyMasked    String   @map("api_key_masked")
+  status          String   @default("ACTIVE")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  posts BinancePost[]
+
+  @@map("binance_accounts")
+}
+
+/// 从 X 拉取到的原始帖子。x_post_id 唯一索引是整个系统去重的根基（§18.3）。
+model XPost {
+  id                   String   @id @default(cuid())
+  /// X 侧 Tweet ID（Snowflake）。唯一索引，INSERT ON CONFLICT DO NOTHING 的依据
+  xPostId              String   @unique @map("x_post_id")
+  xUserId              String   @map("x_user_id")
+  xAccountId           String   @map("x_account_id")
+  text                 String
+  /// ORIGINAL / REPLY / REPOST / QUOTE（§8.1）
+  postType             String   @map("post_type")
+  tweetUrl             String   @map("tweet_url")
+  conversationId       String?  @map("conversation_id")
+  referencedTweetsJson Json?    @map("referenced_tweets_json")
+  editHistoryJson      Json?    @map("edit_history_json")
+  mediaJson            Json?    @map("media_json")
+  entitiesJson         Json?    @map("entities_json")
+  /// X API 原始响应，排错用，不参与业务判定
+  rawJson              Json     @map("raw_json")
+  xCreatedAt           DateTime @map("x_created_at") @db.Timestamptz
+  firstSeenAt          DateTime @default(now()) @map("first_seen_at") @db.Timestamptz
+  /// X 原帖在同步后被编辑过；Binance 侧无法跟随修改（§13.1）
+  editedAfterSync      Boolean  @default(false) @map("edited_after_sync")
+  status               String   @default("NEW")
+
+  xAccount XAccount  @relation(fields: [xAccountId], references: [id])
+  jobs     SyncJob[]
+
+  @@index([xAccountId, xCreatedAt(sort: Desc)])
+  @@map("x_posts")
+}
+
+/// 一次「X 帖子 → Binance 发布」的任务实例。
+model SyncJob {
+  id              String     @id @default(cuid())
+  /// 外键指向 XPost.id（cuid），不是 X 侧的 Tweet ID
+  xPostId         String     @map("x_post_id")
+  /// sha256(x_post_id + binance_account_id + content_hash)，防重复发布的第二道防线（§9.4）
+  idempotencyKey  String     @unique @map("idempotency_key")
+  status          JobStatus  @default(DISCOVERED)
+  /// 命中哪条规则被 FILTERED，用于排查「为什么这条没同步」（§17.5）
+  filterReason    String?    @map("filter_reason")
+  attempt         Int        @default(0)
+  /// 最终发往 Binance 的正文（§21.2）
+  contentSnapshot String?    @map("content_snapshot")
+  scheduledAt     DateTime?  @map("scheduled_at") @db.Timestamptz
+  startedAt       DateTime?  @map("started_at") @db.Timestamptz
+  finishedAt      DateTime?  @map("finished_at") @db.Timestamptz
+  errorCode       String?    @map("error_code")
+  errorMessage    String?    @map("error_message")
+  /// TIMEOUT / HTTP_504 / CONNECTION_RESET（§9.3）
+  uncertainReason String?    @map("uncertain_reason")
+
+  xPost        XPost           @relation(fields: [xPostId], references: [id])
+  binancePosts BinancePost[]
+  history      SyncJobEvent[]
+
+  @@index([status, scheduledAt])
+  @@map("sync_jobs")
+}
+
+/// 状态转移审计，详情页「完整任务历史」的数据来源（§17.4）。
+model SyncJobEvent {
+  id         String   @id @default(cuid())
+  syncJobId  String   @map("sync_job_id")
+  fromStatus String?  @map("from_status")
+  toStatus   String   @map("to_status")
+  detail     Json?
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  syncJob SyncJob @relation(fields: [syncJobId], references: [id])
+
+  @@index([syncJobId, createdAt])
+  @@map("sync_job_events")
+}
+
+/// 实际发布到 Binance 的结果记录。
+model BinancePost {
+  id               String    @id @default(cuid())
+  syncJobId        String    @map("sync_job_id")
+  xPostId          String    @map("x_post_id")
+  binanceAccountId String    @map("binance_account_id")
+  /// UNCERTAIN 经人工「确认已发布」时可为空（§9.3）
+  binancePostId    String?   @map("binance_post_id")
+  binancePostUrl   String?   @map("binance_post_url")
+  contentSnapshot  String    @map("content_snapshot")
+  mediaSnapshot    Json?     @map("media_snapshot")
+  status           String
+  publishedAt      DateTime? @map("published_at") @db.Timestamptz
+
+  syncJob        SyncJob        @relation(fields: [syncJobId], references: [id])
+  binanceAccount BinanceAccount @relation(fields: [binanceAccountId], references: [id])
+
+  /// 幂等：同一任务对同一账号只能有一条
+  @@unique([syncJobId, binanceAccountId])
+  @@map("binance_posts")
+}
+
+/// 键值型系统设置（同步规则、文本模式、发布时机等，§17.5）。
+model Setting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@map("settings")
+}
+
+/// 后台所有写操作的审计日志（§20.3）。
+model AuditLog {
+  id         String   @id @default(cuid())
+  action     String
+  operator   String
+  targetType String?  @map("target_type")
+  targetId   String?  @map("target_id")
+  metadata   Json?
+  ipAddress  String?  @map("ip_address")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  @@index([createdAt(sort: Desc)])
+  @@map("audit_logs")
+}
+
+/// X API 用量采集，成本估算与 Usage endpoint 对账的数据来源（§18.5）。
+model ApiUsageLog {
+  id             String   @id @default(cuid())
+  xAccountId     String?  @map("x_account_id")
+  endpoint       String
+  /// 本次响应返回的资源数，即计费单位（§18.2）
+  resourcesCount Int      @map("resources_count")
+  unitCostUsd    Decimal  @map("unit_cost_usd") @db.Decimal(10, 6)
+  totalCostUsd   Decimal  @map("total_cost_usd") @db.Decimal(10, 6)
+  /// 是否命中 Owned Reads 优惠价（$0.001 vs $0.005，§18.1）
+  isOwnedRead    Boolean  @map("is_owned_read")
+  httpStatus     Int?     @map("http_status")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  @@index([createdAt(sort: Desc)])
+  @@index([endpoint, createdAt])
+  @@map("api_usage_logs")
+}

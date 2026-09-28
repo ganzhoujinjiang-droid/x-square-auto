@@ -1,0 +1,24 @@
+{
+  "name": "@x-square/web",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "next build",
+    "typecheck": "tsc --noEmit",
+    "test": "echo \"(web tests run in CI via vitest)\"",
+    "lint": "echo \"(lint not configured)\"",
+    "dev": "next dev -p 3000",
+    "start": "next start -p 3000"
+  },
+  "dependencies": {
+    "next": "^15.1.6",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "@types/react": "^19.0.8",
+    "@types/react-dom": "^19.0.3",
+    "typescript": "^5.7.3"
+  }
+}

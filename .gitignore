@@ -1,0 +1,39 @@
+# --- dependencies ---
+node_modules/
+.pnpm-store/
+
+# --- build output ---
+dist/
+build/
+.next/
+out/
+*.tsbuildinfo
+
+# --- secrets: NEVER commit ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+secrets/
+docker/secrets/
+
+# --- runtime data ---
+logs/
+*.log
+tmp/
+media-tmp/
+coverage/
+.nyc_output/
+
+# --- prisma ---
+prisma/*.db
+prisma/dev.db*
+
+# --- editors / os ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
